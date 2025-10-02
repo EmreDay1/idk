@@ -1,0 +1,1614 @@
+// renderer.mjs - Simple integration without edge system
+
+import { CoordinateSystem } from "./renderer/coordinateSystem.mjs";
+import { ShapeStyleManager } from "./renderer/styleManager.mjs";
+import { ShapeRenderer } from "./renderer/shapeRenderer.mjs";
+import { PathRenderer } from "./renderer/pathRenderer.mjs";
+import { BooleanOperationRenderer } from "./renderer/booleanRenderer.mjs";
+import { SelectionSystem } from "./renderer/selectionSystem.mjs";
+import { HandleSystem } from "./renderer/handleSystem.mjs";
+import { DebugVisualizer } from "./renderer/debugVisualizer.mjs";
+import { TransformManager } from "./renderer/transformManager.mjs";
+import { shapeManager } from "./shapeManager.mjs";
+
+export class Renderer {
+  constructor(canvas) {
+    try {
+      this.canvas = canvas;
+      this.ctx = canvas.getContext("2d");
+
+      this._overlayDrawers = [];
+
+      this.initializeComponents();
+      this.initializeState();
+      this.setupCanvas();
+      this.setupInteractivity();
+      this.enableInteractiveMode();
+
+      shapeManager.registerRenderer(this);
+    } catch (error) {
+      console.error("Error initializing renderer:", error);
+      this.setupFallbackCanvas();
+    }
+  }
+
+  initializeComponents() {
+    this.coordinateSystem = new CoordinateSystem(this.canvas);
+    this.styleManager = new ShapeStyleManager();
+    this.shapeRenderer = new ShapeRenderer(this.ctx);
+    this.pathRenderer = new PathRenderer(this.ctx);
+    this.booleanRenderer = new BooleanOperationRenderer(this.ctx);
+    this.selectionSystem = new SelectionSystem(this);
+    this.handleSystem = new HandleSystem(this);
+    this.debugVisualizer = new DebugVisualizer(this.ctx);
+    this.transformManager = new TransformManager();
+
+    this.interactionHandler = new SimpleInteractionHandler(this);
+    this.renderingEngine = new ModularRenderingEngine(this);
+  }
+
+  initializeState() {
+    this.shapes = new Map();
+    this.selectedShape = null;
+    this.hoveredShape = null;
+    this.debugMode = false;
+    this.updateCodeCallback = null;
+    this.shapeManager = shapeManager;
+    this.varsOverlayEl = null;
+    this.varsOverlayShapeName = null;
+  }
+
+  addOverlayDrawer(drawFn) {
+    if (typeof drawFn === 'function' && !this._overlayDrawers.includes(drawFn)) {
+      this._overlayDrawers.push(drawFn);
+      this.redraw();
+    }
+  }
+
+  removeOverlayDrawer(drawFn) {
+    const i = this._overlayDrawers.indexOf(drawFn);
+    if (i >= 0) this._overlayDrawers.splice(i, 1);
+    this.redraw();
+  }
+
+  setShapes(shapes) {
+    try {
+      if (!shapes) {
+        this.shapes = new Map();
+      } else {
+        this.shapes = shapes;
+        shapeManager.registerInterpreter({ env: { shapes } });
+      }
+      
+      this.selectedShape = null;
+      this.hoveredShape = null;
+      this.selectionSystem.clearSelection();
+      this.handleSystem.clearHandleState();
+      this.redraw();
+    } catch (error) {
+      console.error("Error setting shapes:", error);
+      this.shapes = new Map();
+    }
+  }
+
+  redraw() {
+    try {
+      this.clear();
+
+      if (!this.shapes) return;
+
+      const renderableShapes = this.filterRenderableShapes();
+      const sortedShapes = this.sortShapesByRenderOrder(renderableShapes);
+
+      // Render shapes
+      for (const { name, shape } of sortedShapes) {
+        const isSelected = shape === this.selectedShape || 
+                          shape === this.interactionHandler.selectedShape;
+        const isHovered = name === this.hoveredShape && !isSelected;
+
+        this.drawShape(shape, isSelected, isHovered, name);
+      }
+
+      if (this.debugMode) {
+        this.debugVisualizer.drawOverlay(this.shapes, this.coordinateSystem);
+      }
+    } catch (error) {
+      console.error("Error in redraw:", error);
+      this.fallbackRedraw();
+    }
+
+    if (this._overlayDrawers && this._overlayDrawers.length) {
+      const ctx = this.ctx; 
+      const cs  = this.coordinateSystem; 
+      this._overlayDrawers.forEach(fn => {
+        try { fn(ctx, cs); } catch(e) { }
+      });
+    }
+      // Keep variable overlay positioned on every frame
+      if (this.varsOverlayEl && this.varsOverlayShapeName) {
+        this.refreshVarsOverlayValues();
+      }
+  }
+
+  notifyShapeChanged(shape, action = "update") {
+    try {
+      if (!this.updateCodeCallback || !shape) return;
+
+      let shapeName = null;
+      if (this.shapes) {
+        for (const [name, s] of this.shapes.entries()) {
+          if (s === shape) {
+            shapeName = name;
+            break;
+          }
+        }
+      }
+
+      if (shape.transform && shape.transform.position && shape.transform.position.length > 2) {
+        shape.transform.position.length = 2;
+      }
+
+      if (shapeName) {
+        this.updateCodeCallback({
+          action: action,
+          name: shapeName,
+          shape: shape,
+        });
+      }
+    } catch (error) {
+      console.error("Error in notifyShapeChanged:", error);
+    }
+  }
+
+  // ===== Inline variable overlay (under selected geometry) =====
+  getShapeASTNode(shapeName) {
+    try {
+      const pm = window.parameterManager || window.parameter_manager || null;
+      const ast = pm?.ast;
+      let list = ast;
+      if (!list || !Array.isArray(list)) {
+        // Fallback: read AST from UI JSON (View AST panel)
+        const pre = document.getElementById('ast-output');
+        if (pre && pre.textContent) {
+          try {
+            const parsed = JSON.parse(pre.textContent);
+            if (Array.isArray(parsed)) list = parsed;
+          } catch (_) {}
+        }
+      }
+      if (!list || !Array.isArray(list)) return null;
+      return list.find(n => n.type === 'shape' && n.name === shapeName) || null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  getIdentifierBindingsForShape(shapeName) {
+    const result = [];
+    try {
+      // Support boolean result shapes by aggregating from sourceShapes
+      const shape = this.shapes?.get?.(shapeName);
+      const sources = Array.isArray(shape?.sourceShapes) ? shape.sourceShapes : [shapeName];
+      const seen = new Set();
+      for (const srcName of sources) {
+        const node = this.getShapeASTNode(srcName);
+        if (!node || !node.params) continue;
+        const paramEntries = Object.entries(node.params);
+        for (const [paramKey, expr] of paramEntries) {
+          if (expr && (expr.type === 'identifier' || expr.type === 'Identifier')) {
+            const varName = expr.name || expr.value || null;
+            if (!varName) continue;
+            if (seen.has(varName)) continue;
+            let value;
+            try {
+              const interp = window.interpreter || null;
+              const paramsMap = interp?.env?.parameters;
+              value = typeof paramsMap?.get === 'function' ? paramsMap.get(varName) : undefined;
+            } catch (_) {
+              value = undefined;
+            }
+            result.push({ varName, value, paramKey, sourceShape: srcName });
+            seen.add(varName);
+          }
+        }
+      }
+    } catch (e) {}
+    return result;
+  }
+
+  ensureVarsOverlayEl() {
+    if (this.varsOverlayEl) return this.varsOverlayEl;
+    const el = document.createElement('div');
+    el.className = 'shape-vars-overlay';
+    el.style.position = 'absolute';
+    el.style.pointerEvents = 'auto';
+    el.style.background = 'rgba(255,255,240,0.95)';
+    el.style.border = '1px solid #ccc';
+    el.style.borderRadius = '4px';
+    el.style.fontFamily = 'monospace';
+    el.style.fontSize = '12px';
+    el.style.boxShadow = '0 2px 6px rgba(0,0,0,0.15)';
+    el.style.padding = '6px 8px';
+    el.style.zIndex = '1001';
+    el.style.maxWidth = '260px';
+    el.style.display = 'none';
+    // Table-like layout styles
+    el.style.display = 'none';
+    this.canvas.parentElement.appendChild(el);
+    this.varsOverlayEl = el;
+    return el;
+  }
+
+  showVarsOverlay(shapeName) {
+    const bindings = this.getIdentifierBindingsForShape(shapeName);
+    const el = this.ensureVarsOverlayEl();
+    this.varsOverlayShapeName = shapeName;
+
+    if (!bindings.length) {
+      // Nothing to show for this shape
+      // Show a tiny hint that no variables are used
+      el.innerHTML = '<div style="opacity:0.7">No variables</div>';
+      el.style.display = 'block';
+      this.updateVarsOverlayPosition(shapeName);
+      return;
+    }
+
+    // Build content
+    el.innerHTML = this.buildVarsTableHTML(bindings);
+    el.style.display = 'block';
+    this.updateVarsOverlayPosition(shapeName);
+  }
+
+  updateVarsOverlayPosition(shapeName) {
+    if (!this.varsOverlayEl || this.varsOverlayEl.style.display === 'none') return;
+    const shape = this.shapes?.get?.(shapeName);
+    if (!shape || !shape.transform) return;
+
+    const canvasRect = this.canvas.getBoundingClientRect();
+    const shapeX = this.coordinateSystem.transformX(shape.transform.position[0]);
+    const shapeY = this.coordinateSystem.transformY(shape.transform.position[1]);
+    const b = this.transformManager.calculateBounds(shape);
+    // Desired anchor point: just below the shape's screen bounds
+    const anchorX = shapeX;
+    const anchorY = shapeY + (b?.height || 0) / 2 + 12;
+
+    // Position relative to canvas parent
+    const left = Math.round(anchorX - (this.varsOverlayEl.offsetWidth / 2));
+    const top  = Math.round(anchorY);
+    this.varsOverlayEl.style.left = `${left}px`;
+    this.varsOverlayEl.style.top = `${top}px`;
+  }
+
+  refreshVarsOverlayValues() {
+    if (!this.varsOverlayShapeName || !this.varsOverlayEl) return;
+    // Rebuild content with latest values
+    const bindings = this.getIdentifierBindingsForShape(this.varsOverlayShapeName);
+    if (!bindings.length) {
+      this.hideVarsOverlay();
+      return;
+    }
+    this.varsOverlayEl.innerHTML = this.buildVarsTableHTML(bindings);
+    this.updateVarsOverlayPosition(this.varsOverlayShapeName);
+  }
+
+  hideVarsOverlay() {
+    if (this.varsOverlayEl) {
+      this.varsOverlayEl.style.display = 'none';
+    }
+    this.varsOverlayShapeName = null;
+  }
+
+  buildVarsTableHTML(bindings) {
+    const header = `<div style="display:grid; grid-template-columns: 1fr auto; gap:6px; font-weight:bold; border-bottom:1px solid #ddd; padding-bottom:4px; margin-bottom:4px;"><div>Variable</div><div style=\"text-align:right;\">Value</div></div>`;
+    const rows = bindings.map(b => {
+      const value = (b.value !== undefined && b.value !== null) ? b.value : '—';
+      const src = b.paramKey ? `<span style=\"opacity:.7\"> (${b.paramKey})</span>` : '';
+      return `<div style="display:grid; grid-template-columns: 1fr auto; gap:6px; padding:2px 0;"><div>${b.varName}${src}</div><div style=\"text-align:right;\">${value}</div></div>`;
+    }).join('');
+    return header + rows;
+  }
+
+  setupCanvas() {
+    this.coordinateSystem.setupCanvas();
+    this.createGridToggleButton();
+    this.redraw();
+  }
+
+  setupFallbackCanvas() {
+    this.coordinateSystem = {
+      transformX: (x) => x + 400,
+      transformY: (y) => 300 - y,
+      clear: () => this.ctx.clearRect(0, 0, 800, 600),
+      isGridEnabled: true,
+      toggleGrid: () => { },
+    };
+    this.styleManager = {
+      createStyleContext: () => ({}),
+      applyStyle: () => { },
+    };
+    this.transformManager = {
+      calculateBounds: () => ({ x: -25, y: -25, width: 50, height: 50 }),
+    };
+  }
+
+  setupInteractivity() {
+    this.interactionHandler.setupEventListeners();
+  }
+
+  enableInteractiveMode() {
+    this.canvas.className = "";
+    this.redraw();
+  }
+
+  createGridToggleButton() {
+    try {
+      const existingButton = document.getElementById("grid-toggle-btn");
+      if (existingButton) {
+        existingButton.remove();
+      }
+
+      const gridButton = document.createElement("button");
+      gridButton.id = "grid-toggle-btn";
+      gridButton.className = "grid-toggle-button";
+      gridButton.innerHTML = `
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="5" cy="5" r="1" fill="currentColor"/>
+          <circle cx="12" cy="5" r="1" fill="currentColor"/>
+          <circle cx="19" cy="5" r="1" fill="currentColor"/>
+          <circle cx="5" cy="12" r="1" fill="currentColor"/>
+          <circle cx="12" cy="12" r="1" fill="currentColor"/>
+          <circle cx="19" cy="12" r="1" fill="currentColor"/>
+          <circle cx="5" cy="19" r="1" fill="currentColor"/>
+          <circle cx="12" cy="19" r="1" fill="currentColor"/>
+          <circle cx="19" cy="19" r="1" fill="currentColor"/>
+        </svg>
+      `;
+
+      gridButton.addEventListener("click", () => {
+        this.coordinateSystem.toggleGrid();
+        this.updateGridButtonState();
+        this.redraw();
+      });
+
+      this.canvas.parentElement.appendChild(gridButton);
+      this.updateGridButtonState();
+    } catch (error) {
+      console.error("Error creating grid toggle button:", error);
+    }
+  }
+
+  updateGridButtonState() {
+    try {
+      const gridButton = document.getElementById("grid-toggle-btn");
+      if (gridButton) {
+        if (this.coordinateSystem.isGridEnabled) {
+          gridButton.classList.add("active");
+          gridButton.style.backgroundColor = "#FF5722";
+          gridButton.style.color = "white";
+        } else {
+          gridButton.classList.remove("active");
+          gridButton.style.backgroundColor = "rgba(255, 255, 255, 0.9)";
+          gridButton.style.color = "#6B7280";
+        }
+      }
+    } catch (error) {
+      console.error("Error updating grid button state:", error);
+    }
+  }
+
+  clear() {
+    this.coordinateSystem.clear();
+  }
+
+  filterRenderableShapes() {
+    const renderable = [];
+
+    for (const [name, shape] of this.shapes.entries()) {
+      if (!shape) continue;
+
+      if (shape._consumedByBoolean) {
+        if (this.debugMode) {
+          console.log(`Skipping consumed shape: ${name}`);
+        }
+        continue;
+      }
+
+      renderable.push({ name, shape });
+    }
+
+    return renderable;
+  }
+
+  sortShapesByRenderOrder(shapes) {
+    return shapes.sort((a, b) => {
+      const aIsBool = a.shape.params?.operation ? 1 : 0;
+      const bIsBool = b.shape.params?.operation ? 1 : 0;
+
+      if (aIsBool !== bIsBool) {
+        return aIsBool - bIsBool;
+      }
+
+      return 0;
+    });
+  }
+
+  fallbackRedraw() {
+    try {
+      this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height);
+      this.ctx.fillStyle = "#FAFAFA";
+      this.ctx.fillRect(0, 0, this.canvas.width, this.canvas.height);
+    } catch (e) {
+      console.error("Failed to recover from redraw error:", e);
+    }
+  }
+
+  drawShape(shape, isSelected = false, isHovered = false, shapeName = "") {
+    try {
+      if (!shape || !shape.type || !shape.transform) {
+        return;
+      }
+
+      const transformContext = this.transformManager.createContext(
+        shape.transform,
+        this.coordinateSystem.transformX(shape.transform.position[0]),
+        this.coordinateSystem.transformY(shape.transform.position[1]),
+        1,
+      );
+
+      this.ctx.save();
+      this.ctx.translate(transformContext.screenX, transformContext.screenY);
+      this.ctx.rotate(-transformContext.rotation);
+
+      const styleContext = this.styleManager.createStyleContext(
+        shape,
+        isSelected,
+        isHovered,
+      );
+      this.styleManager.applyStyle(this.ctx, styleContext);
+
+      this.renderingEngine.renderShape(
+        shape,
+        styleContext,
+        isSelected,
+        isHovered,
+      );
+
+      if (isSelected) {
+        this.drawSelectionUIInContext(shape, shapeName);
+      }
+
+      if (isHovered && !isSelected) {
+        this.drawHoverUIInContext(shape);
+      }
+
+      this.ctx.restore();
+
+      if (
+        isSelected &&
+        shape.params.operation &&
+        this.selectionSystem.showOperationLabels
+      ) {
+        this.selectionSystem.drawOperationLabel(shape, shape.params.operation);
+      }
+
+      if (this.debugMode) {
+        this.debugVisualizer.visualizeShape(shape, transformContext, shapeName);
+      }
+    } catch (error) {
+      console.error("Error drawing shape:", error);
+    }
+  }
+
+  drawSelectionUIInContext(shape, shapeName) {
+    const bounds = this.transformManager.calculateBounds(shape);
+    const shapeWidth = bounds.width;
+    const shapeHeight = bounds.height;
+    const padding = 16;
+    const outlineWidth = shapeWidth + padding * 2;
+    const outlineHeight = shapeHeight + padding * 2;
+
+    this.ctx.save();
+    
+    this.ctx.strokeStyle = '#FF5722';
+    this.ctx.lineWidth = 2;
+    this.ctx.setLineDash([]);
+    this.ctx.beginPath();
+    this.ctx.roundRect(
+      -outlineWidth / 2, 
+      -outlineHeight / 2, 
+      outlineWidth, 
+      outlineHeight, 
+      10
+    );
+    
+    this.ctx.shadowColor = 'rgba(255, 87, 34, 0.2)';
+    this.ctx.shadowBlur = 15;
+    this.ctx.shadowOffsetX = 0;
+    this.ctx.shadowOffsetY = 0;
+    this.ctx.stroke();
+
+    this.ctx.shadowBlur = 0;
+    this.ctx.fillStyle = 'rgba(255, 87, 34, 0.1)';
+    this.ctx.fill();
+
+    this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
+    this.ctx.lineWidth = 1;
+    this.ctx.beginPath();
+    this.ctx.roundRect(
+      -outlineWidth / 2 + 1, 
+      -outlineHeight / 2 + 1, 
+      outlineWidth - 2, 
+      outlineHeight - 2, 
+      9
+    );
+    this.ctx.stroke();
+
+    this.ctx.restore();
+
+    this.drawOrangeCornerHandles(shape, shapeWidth, shapeHeight);
+    this.drawOrangeRotationHandle(shape, shapeHeight);
+  }
+
+  drawHoverUIInContext(shape) {
+    const bounds = this.transformManager.calculateBounds(shape);
+    const shapeWidth = bounds.width;
+    const shapeHeight = bounds.height;
+    const hoverPadding = 12;
+
+    this.ctx.save();
+    
+    this.ctx.shadowColor = 'rgba(255, 87, 34, 0.4)';
+    this.ctx.shadowBlur = 15;
+    
+    this.ctx.strokeStyle = '#FF5722';
+    this.ctx.lineWidth = 2;
+    this.ctx.setLineDash([6, 3]);
+    this.ctx.beginPath();
+    this.ctx.roundRect(
+      -shapeWidth / 2 - hoverPadding,
+      -shapeHeight / 2 - hoverPadding,
+      shapeWidth + hoverPadding * 2,
+      shapeHeight + hoverPadding * 2,
+      8
+    );
+    this.ctx.stroke();
+    this.ctx.setLineDash([]);
+
+    this.ctx.shadowBlur = 0;
+    this.ctx.fillStyle = 'rgba(255, 87, 34, 0.12)';
+    this.ctx.fill();
+
+    this.ctx.restore();
+  }
+
+  drawOrangeCornerHandles(shape, shapeWidth, shapeHeight) {
+    const handlePositions = [
+      { x: -shapeWidth / 2, y: -shapeHeight / 2, handle: "tl" },
+      { x: shapeWidth / 2, y: -shapeHeight / 2, handle: "tr" },
+      { x: shapeWidth / 2, y: shapeHeight / 2, handle: "br" },
+      { x: -shapeWidth / 2, y: shapeHeight / 2, handle: "bl" }
+    ];
+
+    handlePositions.forEach((pos) => {
+      const isHovered = this.interactionHandler.hoveredHandle === pos.handle;
+      const isActive = this.interactionHandler.activeHandle === pos.handle;
+      
+      this.ctx.save();
+      this.ctx.translate(pos.x, pos.y);
+
+      const handleSize = 14;
+      const scaledSize = isHovered ? handleSize * 1.3 : isActive ? handleSize * 1.1 : handleSize;
+
+      this.ctx.shadowColor = 'rgba(255, 87, 34, 0.4)';
+      this.ctx.shadowBlur = isHovered ? 12 : 6;
+      this.ctx.shadowOffsetX = 0;
+      this.ctx.shadowOffsetY = isHovered ? 4 : 2;
+
+      this.ctx.beginPath();
+      this.ctx.roundRect(-scaledSize/2, -scaledSize/2, scaledSize, scaledSize, 3);
+      
+      const gradient = this.ctx.createLinearGradient(
+        -scaledSize/2, -scaledSize/2, 
+        scaledSize/2, scaledSize/2
+      );
+      
+      if (isHovered) {
+        gradient.addColorStop(0, '#FF7043');
+        gradient.addColorStop(1, '#E64A19');
+      } else {
+        gradient.addColorStop(0, '#FF5722');
+        gradient.addColorStop(1, '#E64A19');
+      }
+      
+      this.ctx.fillStyle = gradient;
+      this.ctx.fill();
+
+      this.ctx.shadowBlur = 0;
+      this.ctx.strokeStyle = 'white';
+      this.ctx.lineWidth = 2;
+      this.ctx.stroke();
+
+      this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+      this.ctx.lineWidth = 1;
+      this.ctx.beginPath();
+      this.ctx.roundRect(-scaledSize/2 + 1.5, -scaledSize/2 + 1.5, scaledSize - 3, scaledSize - 3, 2);
+      this.ctx.stroke();
+
+      this.ctx.restore();
+    });
+  }
+
+  drawOrangeRotationHandle(shape, shapeHeight) {
+    const rotationDistance = 45;
+    const rotationY = -shapeHeight / 2 - rotationDistance;
+    const isHovered = this.interactionHandler.hoveredHandle === "rotate";
+    const isActive = this.interactionHandler.activeHandle === "rotate";
+
+    this.ctx.save();
+
+    const lineWidth = 3;
+    const lineGradient = this.ctx.createLinearGradient(
+      0, -shapeHeight / 2, 
+      0, rotationY + 12
+    );
+    lineGradient.addColorStop(0, 'rgba(255, 87, 34, 0.9)');
+    lineGradient.addColorStop(0.6, 'rgba(255, 87, 34, 0.6)');
+    lineGradient.addColorStop(1, 'rgba(255, 87, 34, 0.3)');
+    
+    this.ctx.shadowColor = 'rgba(255, 87, 34, 0.5)';
+    this.ctx.shadowBlur = 4;
+    this.ctx.strokeStyle = lineGradient;
+    this.ctx.lineWidth = lineWidth;
+    this.ctx.lineCap = 'round';
+    this.ctx.beginPath();
+    this.ctx.moveTo(0, -shapeHeight / 2);
+    this.ctx.lineTo(0, rotationY + 12);
+    this.ctx.stroke();
+
+    this.ctx.shadowBlur = 0;
+
+    if (isHovered || isActive) {
+      this.ctx.save();
+      this.ctx.translate(0, rotationY);
+      
+      this.ctx.strokeStyle = 'rgba(255, 87, 34, 0.6)';
+      this.ctx.lineWidth = 2;
+      this.ctx.setLineDash([4, 4]);
+      this.ctx.beginPath();
+      this.ctx.arc(0, 0, 22, 0, Math.PI * 2);
+      this.ctx.stroke();
+      this.ctx.setLineDash([]);
+      
+      this.ctx.restore();
+    }
+
+    this.ctx.save();
+    this.ctx.translate(0, rotationY);
+    
+    const handleSize = 18;
+    const scaledHandleSize = isActive ? handleSize * 1.05 : isHovered ? handleSize * 1.15 : handleSize;
+
+    this.ctx.shadowColor = 'rgba(255, 87, 34, 0.5)';
+    this.ctx.shadowBlur = isHovered ? 15 : 8;
+    this.ctx.shadowOffsetX = 0;
+    this.ctx.shadowOffsetY = 3;
+
+    this.ctx.beginPath();
+    this.ctx.arc(0, 0, scaledHandleSize/2, 0, Math.PI * 2);
+    
+    const handleGradient = this.ctx.createRadialGradient(
+      -scaledHandleSize/5, -scaledHandleSize/5, 0, 
+      0, 0, scaledHandleSize/2
+    );
+    
+    if (isHovered) {
+      handleGradient.addColorStop(0, '#FF9800');
+      handleGradient.addColorStop(0.4, '#FF5722');
+      handleGradient.addColorStop(1, '#D84315');
+    } else {
+      handleGradient.addColorStop(0, '#FF7043');
+      handleGradient.addColorStop(0.4, '#FF5722');
+      handleGradient.addColorStop(1, '#E64A19');
+    }
+    
+    this.ctx.fillStyle = handleGradient;
+    this.ctx.fill();
+
+    this.ctx.shadowBlur = 0;
+    this.ctx.strokeStyle = 'white';
+    this.ctx.lineWidth = 2.5;
+    this.ctx.stroke();
+
+    this.ctx.strokeStyle = 'white';
+    this.ctx.lineWidth = 2.5;
+    this.ctx.lineCap = 'round';
+    
+    this.ctx.beginPath();
+    this.ctx.arc(0, 0, scaledHandleSize/3.2, -Math.PI/3, Math.PI * 1.3);
+    this.ctx.stroke();
+    
+    const arrowX = (scaledHandleSize/3.2) * Math.cos(Math.PI * 1.3);
+    const arrowY = (scaledHandleSize/3.2) * Math.sin(Math.PI * 1.3);
+    
+    this.ctx.beginPath();
+    this.ctx.moveTo(arrowX, arrowY);
+    this.ctx.lineTo(arrowX - 3, arrowY - 2);
+    this.ctx.moveTo(arrowX, arrowY);
+    this.ctx.lineTo(arrowX - 2, arrowY + 3);
+    this.ctx.stroke();
+
+    this.ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+    this.ctx.lineWidth = 1.5;
+    this.ctx.beginPath();
+    this.ctx.arc(-scaledHandleSize/5, -scaledHandleSize/5, scaledHandleSize/4, 0, Math.PI * 0.7);
+    this.ctx.stroke();
+
+    this.ctx.restore();
+    this.ctx.restore();
+  }
+
+  setUpdateCodeCallback(callback) {
+    this.updateCodeCallback = callback;
+  }
+
+  findShapeName(shapeObject) {
+    for (const [name, shape] of this.shapes.entries()) {
+      if (shape === shapeObject) {
+        return name;
+      }
+    }
+    return null;
+  }
+
+  setDebugMode(enabled) {
+    this.debugMode = enabled;
+    this.debugVisualizer.setEnabled(enabled);
+    this.booleanRenderer.setDebugMode(enabled);
+    this.redraw();
+  }
+
+  getSelectedShape() {
+    return this.interactionHandler.selectedShape || this.selectedShape;
+  }
+
+  setSelectedShape(shape) {
+    this.interactionHandler.selectedShape = shape;
+    this.selectedShape = shape;
+    this.selectionSystem.setSelectedShape(shape);
+    this.redraw();
+  }
+
+  getHoveredShape() {
+    return this.interactionHandler.hoveredShape;
+  }
+
+  setHoveredShape(shapeName) {
+    this.interactionHandler.hoveredShape = shapeName;
+    this.hoveredShape = shapeName;
+    this.selectionSystem.setHoveredShape(shapeName);
+    this.redraw();
+  }
+
+  selectShapeAtPoint(x, y) {
+    return this.interactionHandler.selectShapeAtPoint(x, y);
+  }
+
+  isPointInShape(x, y, shape) {
+    return this.interactionHandler.isPointInShape(x, y, shape);
+  }
+
+  getHandleAtPoint(x, y) {
+    return this.handleSystem.getHandleAtPoint(
+      x,
+      y,
+      this.selectedShape || this.interactionHandler.selectedShape,
+    );
+  }
+
+  toggleFillForSelectedShape() {
+    try {
+      const selected = this.selectedShape || this.interactionHandler.selectedShape;
+      if (!selected) return;
+
+      const shapeName = this.findShapeName(selected);
+      if (!shapeName) return;
+
+      const shape = selected;
+      const currentFill = shape.params.fill || false;
+
+      this.shapeManager.onCanvasShapeChange(shapeName, "fill", !currentFill);
+
+      if (!currentFill && !shape.params.fillColor) {
+        this.shapeManager.onCanvasShapeChange(
+          shapeName,
+          "fillColor",
+          "#808080",
+        );
+      }
+
+      this.notifyShapeChanged(selected);
+    } catch (error) {
+      console.error("Error toggling fill:", error);
+    }
+  }
+
+  setFillColorForSelectedShape(color) {
+    try {
+      const selected = this.selectedShape || this.interactionHandler.selectedShape;
+      if (!selected) return;
+
+      const shapeName = this.findShapeName(selected);
+      if (!shapeName) return;
+
+      this.shapeManager.onCanvasShapeChange(shapeName, "fill", true);
+      this.shapeManager.onCanvasShapeChange(shapeName, "fillColor", color);
+
+      this.notifyShapeChanged(selected);
+    } catch (error) {
+      console.error("Error setting fill color:", error);
+    }
+  }
+
+  resetView() {
+    this.coordinateSystem.setPanOffset(0, 0);
+    this.redraw();
+  }
+
+  fitToView() {
+    if (!this.shapes || this.shapes.size === 0) return;
+
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+
+    for (const [name, shape] of this.shapes.entries()) {
+      if (shape._consumedByBoolean) continue;
+
+      const bounds = this.transformManager.calculateBounds(shape);
+      const x = shape.transform.position[0];
+      const y = shape.transform.position[1];
+
+      minX = Math.min(minX, x + bounds.x);
+      maxX = Math.max(maxX, x + bounds.x + bounds.width);
+      minY = Math.min(minY, y + bounds.y);
+      maxY = Math.max(maxY, y + bounds.y + bounds.height);
+    }
+
+    if (minX === Infinity) return;
+
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    this.coordinateSystem.setPanOffset(-centerX, centerY);
+    this.redraw();
+  }
+
+  exportCanvasAsImage(format = "png") {
+    try {
+      const dataURL = this.canvas.toDataURL(`image/${format}`);
+
+      const link = document.createElement("a");
+      link.download = `aqui_canvas.${format}`;
+      link.href = dataURL;
+      link.click();
+
+      return dataURL;
+    } catch (error) {
+      console.error("Error exporting canvas:", error);
+      return null;
+    }
+  }
+
+  getCanvasInfo() {
+    const bounds = this.coordinateSystem.getCanvasBounds();
+    const viewport = this.coordinateSystem.getViewportBounds();
+
+    return {
+      canvas: bounds,
+      viewport: viewport,
+      scale: this.coordinateSystem.scale,
+      pan: this.coordinateSystem.panOffset,
+      shapeCount: this.shapes.size,
+      selectedShape: this.selectedShape ? this.findShapeName(this.selectedShape) : null,
+      debugMode: this.debugMode,
+      pixelsToMm: this.coordinateSystem.pixelsToMm
+    };
+  }
+
+  destroy() {
+    try {
+      const gridButton = document.getElementById("grid-toggle-btn");
+      if (gridButton) {
+        gridButton.remove();
+      }
+
+      this.shapes.clear();
+      this.selectedShape = null;
+      this.hoveredShape = null;
+      this.updateCodeCallback = null;
+
+      if (this.debugVisualizer) {
+        this.debugVisualizer.reset();
+      }
+
+      if (this.selectionSystem) {
+        this.selectionSystem.clearSelection();
+      }
+
+      if (this.handleSystem) {
+        this.handleSystem.clearHandleState();
+      }
+    } catch (error) {
+      console.error("Error destroying renderer:", error);
+    }
+  }
+}
+
+// Simple interaction handler - without edge functionality
+class SimpleInteractionHandler {
+  constructor(renderer) {
+    this.renderer = renderer;
+    this.canvas = renderer.canvas;
+    this.coordinateSystem = renderer.coordinateSystem;
+    
+    this.selectedShape = null;
+    this.hoveredShape = null;
+    this.dragging = false;
+    this.scaling = false;
+    this.rotating = false;
+    this.panning = false;
+    this.lastMousePos = { x: 0, y: 0 };
+    this.activeHandle = null;
+    this.hoveredHandle = null;
+    
+    this.handleRadius = 6;
+    this.handleHoverRadius = 7;
+    this.rotationHandleDistance = 35;
+  }
+  
+  setupEventListeners() {
+    this.canvas.addEventListener('mousedown', this.handleMouseDown.bind(this));
+    this.canvas.addEventListener('mousemove', this.handleMouseMove.bind(this));
+    this.canvas.addEventListener('mouseup', this.handleMouseUp.bind(this));
+    this.canvas.addEventListener('wheel', this.handleWheel.bind(this));
+    this.canvas.addEventListener('mouseleave', this.handleMouseLeave.bind(this));
+    window.addEventListener('keydown', this.handleKeyDown.bind(this));
+  }
+  
+  handleMouseDown(event) {
+    const rect = this.canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    
+    this.lastMousePos = { x, y };
+    
+    if (event.shiftKey) {
+      this.panning = true;
+      this.canvas.className = 'cursor-grabbing';
+      return;
+    }
+    
+    if (this.selectedShape) {
+      const handleInfo = this.getHandleAtPoint(x, y);
+      if (handleInfo) {
+        if (handleInfo.type === 'scale') {
+          this.scaling = true;
+          this.activeHandle = handleInfo.handle;
+          this.canvas.className = 'cursor-resize-' + this.getResizeCursorClass(handleInfo.handle);
+        } else if (handleInfo.type === 'rotate') {
+          this.rotating = true;
+          this.canvas.className = 'cursor-grabbing';
+        }
+        return;
+      }
+    }
+    
+    this.selectShapeAtPoint(x, y);
+    // Show or hide inline vars overlay depending on selection state
+    const shapeName = this.renderer.findShapeName?.(this.selectedShape);
+    if (shapeName) {
+      this.renderer.showVarsOverlay(shapeName);
+    } else {
+      this.renderer.hideVarsOverlay();
+    }
+    this.renderer.redraw();
+  }
+  
+  handleMouseMove(event) {
+    const rect = this.canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    
+    const dx = x - this.lastMousePos.x;
+    const dy = y - this.lastMousePos.y;
+    
+    if (this.panning) {
+      this.coordinateSystem.pan(dx, dy);
+      this.renderer.redraw();
+      this.renderer.refreshVarsOverlayValues();
+    } else if (this.scaling && this.selectedShape) {
+      this.handleParameterScaling(dx, dy);
+      this.renderer.refreshVarsOverlayValues();
+    } else if (this.rotating && this.selectedShape) {
+      this.handleRotation(x, y);
+      this.renderer.refreshVarsOverlayValues();
+    } else if (this.dragging && this.selectedShape) {
+      this.handleDragging(dx, dy);
+      this.renderer.refreshVarsOverlayValues();
+    } else {
+      this.updateCursor(x, y);
+      this.updateHoverState(x, y);
+    }
+    
+    this.lastMousePos = { x, y };
+  }
+  
+  handleMouseUp(event) {
+    this.dragging = false;
+    this.scaling = false;
+    this.rotating = false;
+    this.panning = false;
+    this.activeHandle = null;
+    
+    const rect = this.canvas.getBoundingClientRect();
+    const x = event.clientX - rect.left;
+    const y = event.clientY - rect.top;
+    this.updateCursor(x, y);
+    // Final refresh of overlay values/position
+    this.renderer.refreshVarsOverlayValues();
+  }
+  
+  handleWheel(event) {
+    event.preventDefault();
+    
+    if (event.ctrlKey) {
+      const panSensitivity = 2;
+      
+      if (event.deltaY !== 0) {
+        this.coordinateSystem.pan(0, -event.deltaY * panSensitivity);
+      }
+      
+      if (event.deltaX !== 0) {
+        this.coordinateSystem.pan(-event.deltaX * panSensitivity, 0);
+      }
+      
+      if (event.deltaX === 0 && event.shiftKey) {
+        this.coordinateSystem.pan(-event.deltaY * panSensitivity, 0);
+      }
+      
+      this.renderer.redraw();
+    }
+  }
+  
+  handleKeyDown(event) {
+    if (event.key.toLowerCase() === 'g' && !event.ctrlKey && !event.metaKey) {
+      if (document.activeElement !== this.renderer.editor?.getWrapperElement()?.querySelector('textarea')) {
+        event.preventDefault();
+        this.coordinateSystem.toggleGrid();
+        this.renderer.updateGridButtonState();
+        this.renderer.redraw();
+      }
+    }
+    
+    if (event.key.toLowerCase() === 'd' && event.ctrlKey) {
+      event.preventDefault();
+      this.renderer.setDebugMode(!this.renderer.debugMode);
+      return;
+    }
+
+    if (!this.selectedShape) return;
+
+    const shapeName = this.renderer.findShapeName(this.selectedShape);
+    if (!shapeName) return;
+    
+    const shape = this.selectedShape;
+    
+    switch (event.key) {
+      case 'Delete':
+      case 'Backspace':
+        event.preventDefault();
+        this.deleteSelectedShape();
+        break;
+      
+      case 'r':
+      case 'R':
+        event.preventDefault();
+        const newRotation = (shape.transform.rotation + 15) % 360;
+        this.renderer.shapeManager.onCanvasRotationChange(shapeName, newRotation);
+        this.renderer.notifyShapeChanged(shape);
+        break;
+        
+      case 'ArrowUp':
+        event.preventDefault();
+        const upAmount = event.shiftKey ? 20 : 5;
+        const newPosUp = [shape.transform.position[0], shape.transform.position[1] + upAmount];
+        this.renderer.shapeManager.onCanvasPositionChange(shapeName, newPosUp);
+        this.renderer.notifyShapeChanged(shape);
+        break;
+        
+      case 'ArrowDown':
+        event.preventDefault();
+        const downAmount = event.shiftKey ? 20 : 5;
+        const newPosDown = [shape.transform.position[0], shape.transform.position[1] - downAmount];
+        this.renderer.shapeManager.onCanvasPositionChange(shapeName, newPosDown);
+        this.renderer.notifyShapeChanged(shape);
+        break;
+        
+      case 'ArrowLeft':
+        event.preventDefault();
+        const leftAmount = event.shiftKey ? 20 : 5;
+        const newPosLeft = [shape.transform.position[0] - leftAmount, shape.transform.position[1]];
+        this.renderer.shapeManager.onCanvasPositionChange(shapeName, newPosLeft);
+        this.renderer.notifyShapeChanged(shape);
+        break;
+        
+      case 'ArrowRight':
+        event.preventDefault();
+        const rightAmount = event.shiftKey ? 20 : 5;
+        const newPosRight = [shape.transform.position[0] + rightAmount, shape.transform.position[1]];
+        this.renderer.shapeManager.onCanvasPositionChange(shapeName, newPosRight);
+        this.renderer.notifyShapeChanged(shape);
+        break;
+    }
+  }
+  
+  handleMouseLeave() {
+    this.hoveredShape = null;
+    this.hoveredHandle = null;
+    this.renderer.redraw();
+    this.renderer.refreshVarsOverlayValues();
+  }
+  
+  selectShapeAtPoint(x, y) {
+    let selectedShapeName = null;
+    
+    if (!this.renderer.shapes) {
+      this.renderer.shapes = new Map();
+      return;
+    }
+    
+    for (const [name, shape] of [...this.renderer.shapes.entries()].reverse()) {
+      if (shape._consumedByBoolean) continue;
+      
+      if (this.isPointInShape(x, y, shape)) {
+        selectedShapeName = name;
+        break;
+      }
+    }
+    
+    if (selectedShapeName) {
+      this.selectedShape = this.renderer.shapes.get(selectedShapeName);
+      this.dragging = true;
+      this.canvas.className = 'cursor-move';
+      // Show overlay immediately on click
+      this.renderer.showVarsOverlay(selectedShapeName);
+    } else {
+      this.selectedShape = null;
+      this.canvas.className = '';
+      this.renderer.hideVarsOverlay();
+    }
+  }
+  
+  isPointInShape(x, y, shape) {
+    if (!shape || !shape.transform) return false;
+    
+    const shapeX = this.coordinateSystem.transformX(shape.transform.position[0]);
+    const shapeY = this.coordinateSystem.transformY(shape.transform.position[1]);
+    
+    const dx = x - shapeX;
+    const dy = y - shapeY;
+    
+    const angle = shape.transform.rotation * Math.PI / 180;
+    const rotatedX = dx * Math.cos(angle) + dy * Math.sin(angle);
+    const rotatedY = dy * Math.cos(angle) - dx * Math.sin(angle);
+    
+    const bounds = this.renderer.transformManager.calculateBounds(shape);
+    const scaledWidth = bounds.width;
+    const scaledHeight = bounds.height;
+    
+    return (
+      Math.abs(rotatedX) <= scaledWidth / 2 &&
+      Math.abs(rotatedY) <= scaledHeight / 2
+    );
+  }
+  
+  getHandleAtPoint(x, y) {
+    if (!this.selectedShape) return null;
+    
+    const shape = this.selectedShape;
+    const shapeX = this.coordinateSystem.transformX(shape.transform.position[0]);
+    const shapeY = this.coordinateSystem.transformY(shape.transform.position[1]);
+    
+    const bounds = this.renderer.transformManager.calculateBounds(shape);
+    const scaledWidth = bounds.width;
+    const scaledHeight = bounds.height;
+    const halfWidth = scaledWidth / 2;
+    const halfHeight = scaledHeight / 2;
+    
+    const angle = -shape.transform.rotation * Math.PI / 180;
+    const rotate = (px, py) => {
+      const s = Math.sin(angle);
+      const c = Math.cos(angle);
+      const dx = px - shapeX;
+      const dy = py - shapeY;
+      return {
+        x: shapeX + (dx * c - dy * s),
+        y: shapeY + (dx * s + dy * c)
+      };
+    };
+    
+    const handlePositions = [
+      { handle: 'tl', pos: rotate(shapeX - halfWidth, shapeY - halfHeight) },
+      { handle: 'tr', pos: rotate(shapeX + halfWidth, shapeY - halfHeight) },
+      { handle: 'br', pos: rotate(shapeX + halfWidth, shapeY + halfHeight) },
+      { handle: 'bl', pos: rotate(shapeX - halfWidth, shapeY + halfHeight) }
+    ];
+    
+    for (const handleInfo of handlePositions) {
+      const dx = x - handleInfo.pos.x;
+      const dy = y - handleInfo.pos.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      
+      if (dist <= this.handleRadius + 3) {
+        return { type: 'scale', handle: handleInfo.handle };
+      }
+    }
+    
+    const rotHandlePos = rotate(shapeX, shapeY - halfHeight - this.rotationHandleDistance);
+    const rotDx = x - rotHandlePos.x;
+    const rotDy = y - rotHandlePos.y;
+    const rotDist = Math.sqrt(rotDx * rotDx + rotDy * rotDy);
+    
+    if (rotDist <= this.handleRadius + 3) {
+      return { type: 'rotate' };
+    }
+    
+    return null;
+  }
+  
+  updateCursor(x, y) {
+    if (this.selectedShape) {
+      const handleInfo = this.getHandleAtPoint(x, y);
+      
+      if (handleInfo) {
+        if (handleInfo.type === 'scale') {
+          this.canvas.className = 'cursor-resize-' + this.getResizeCursorClass(handleInfo.handle);
+        } else if (handleInfo.type === 'rotate') {
+          this.canvas.className = 'cursor-rotate';
+        }
+        return;
+      }
+    }
+    
+    let isOverShape = false;
+    
+    if (this.renderer.shapes) {
+      for (const [name, shape] of [...this.renderer.shapes.entries()].reverse()) {
+        if (shape._consumedByBoolean) continue;
+        
+        if (this.isPointInShape(x, y, shape)) {
+          this.canvas.className = 'cursor-move';
+          isOverShape = true;
+          break;
+        }
+      }
+    }
+    
+    if (!isOverShape) {
+      this.canvas.className = '';
+    }
+  }
+  
+  updateHoverState(x, y) {
+    let newHoveredShape = null;
+    let newHoveredHandle = null;
+    
+    if (this.selectedShape) {
+      const handleInfo = this.getHandleAtPoint(x, y);
+      if (handleInfo) {
+        newHoveredHandle = handleInfo.handle || 'rotate';
+      }
+    }
+    
+    if (!newHoveredHandle && this.renderer.shapes) {
+      for (const [name, shape] of [...this.renderer.shapes.entries()].reverse()) {
+        if (shape._consumedByBoolean) continue;
+        
+        if (this.isPointInShape(x, y, shape)) {
+          newHoveredShape = name;
+          break;
+        }
+      }
+    }
+    
+    if (newHoveredShape !== this.hoveredShape || newHoveredHandle !== this.hoveredHandle) {
+      this.hoveredShape = newHoveredShape;
+      this.hoveredHandle = newHoveredHandle;
+      this.renderer.redraw();
+    }
+  }
+  
+  getResizeCursorClass(handle) {
+    switch (handle) {
+      case 'tl':
+      case 'br':
+        return 'nwse';
+      case 'tr':
+      case 'bl':
+        return 'nesw';
+      default:
+        return '';
+    }
+  }
+  
+  handleParameterScaling(dx, dy) {
+    if (!this.selectedShape) return;
+    
+    const shapeName = this.renderer.findShapeName(this.selectedShape);
+    if (!shapeName) return;
+    
+    this.renderer.transformManager.handleParameterScaling(
+      this.selectedShape, 
+      this.activeHandle, 
+      dx, 
+      dy, 
+      1,
+      shapeName,
+      this.renderer.shapeManager
+    );
+    
+    this.renderer.notifyShapeChanged(this.selectedShape);
+  }
+  
+  handleRotation(x, y) {
+    if (!this.selectedShape) return;
+    
+    const shapeName = this.renderer.findShapeName(this.selectedShape);
+    if (!shapeName) return;
+    
+    const shape = this.selectedShape;
+    const centerX = this.coordinateSystem.transformX(shape.transform.position[0]);
+    const centerY = this.coordinateSystem.transformY(shape.transform.position[1]);
+    
+    const angle = -Math.atan2(y - centerY, x - centerX) * 180 / Math.PI;
+    
+    let newRotation = angle;
+    if (event.altKey) {
+      newRotation = Math.round(angle / 15) * 15;
+    }
+    
+    this.renderer.shapeManager.onCanvasRotationChange(shapeName, newRotation);
+    this.renderer.notifyShapeChanged(this.selectedShape);
+  }
+  
+  handleDragging(dx, dy) {
+    if (!this.selectedShape) return;
+    
+    const shapeName = this.renderer.findShapeName(this.selectedShape);
+    if (!shapeName) return;
+    
+    const shape = this.selectedShape;
+    
+    const worldDX = dx;
+    const worldDY = -dy;
+    
+    let newX = shape.transform.position[0] + worldDX;
+    let newY = shape.transform.position[1] + worldDY;
+
+    if (this.coordinateSystem.isGridEnabled && event.ctrlKey) {
+      const snapped = this.coordinateSystem.snapToGrid(newX, newY);
+      newX = snapped.x;
+      newY = snapped.y;
+    }
+
+    this.renderer.shapeManager.onCanvasPositionChange(shapeName, [newX, newY]);
+    this.renderer.notifyShapeChanged(this.selectedShape);
+  }
+  
+  deleteSelectedShape() {
+    if (!this.selectedShape) return;
+    
+    let selectedName = null;
+    
+    if (this.renderer.shapes) {
+      for (const [name, shape] of this.renderer.shapes.entries()) {
+        if (shape === this.selectedShape) {
+          selectedName = name;
+          break;
+        }
+      }
+    }
+
+    if (this.renderer.constraintEngine && selectedName) {
+      this.renderer.constraintEngine.pruneConstraintsForShapes([selectedName]);
+    }
+    
+    if (selectedName) {
+      this.renderer.shapes.delete(selectedName);
+      this.selectedShape = null;
+      
+      if (this.renderer.updateCodeCallback) {
+        this.renderer.updateCodeCallback({ action: 'delete', name: selectedName });
+      }
+      
+      this.renderer.redraw();
+    }
+  }
+}
+
+// ModularRenderingEngine unchanged
+class ModularRenderingEngine {
+  constructor(renderer) {
+    this.renderer = renderer;
+    this.ctx = renderer.ctx;
+    this.shapeRenderer = renderer.shapeRenderer;
+    this.pathRenderer = renderer.pathRenderer;
+    this.booleanRenderer = renderer.booleanRenderer;
+  }
+
+  createShapeInstance(type, params) {
+    return this.shapeRenderer.createShapeInstance(type, params);
+  }
+
+  renderShape(shape, styleContext, isSelected, isHovered) {
+    try {
+      const { type, params } = shape;
+
+      if (params.operation) {
+        return this.booleanRenderer.renderBooleanResult(
+          shape,
+          styleContext,
+          isSelected,
+          isHovered,
+        );
+      }
+
+      switch (type) {
+        case "path":
+          return this.pathRenderer.renderPath(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "slotBoard":
+          return this.shapeRenderer.renderSlotBoard(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "tabBoard":
+          return this.shapeRenderer.renderTabBoard(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "text":
+          return this.shapeRenderer.renderText(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "gear":
+          return this.shapeRenderer.renderGear(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "bezier":
+          return this.shapeRenderer.renderBezier(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "dovetailPin":
+          return this.shapeRenderer.renderDovetailPin(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "dovetailTail":
+          return this.shapeRenderer.renderDovetailTail(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "fingerJointPin":
+          return this.shapeRenderer.renderFingerJointPin(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "fingerJointSocket":
+          return this.shapeRenderer.renderFingerJointSocket(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "halfLapMale":
+          return this.shapeRenderer.renderHalfLapMale(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "halfLapFemale":
+          return this.shapeRenderer.renderHalfLapFemale(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "crossLapVertical":
+          return this.shapeRenderer.renderCrossLapVertical(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "flexureMesh":
+          return this.shapeRenderer.renderFlexureMesh(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "crossLapHorizontal":
+          return this.shapeRenderer.renderCrossLapHorizontal(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "rabbetJoint":
+          return this.shapeRenderer.renderRabbetJoint(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "rabbetPlain":
+          return this.shapeRenderer.renderRabbetPlain(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "fingerCombMale":
+          return this.shapeRenderer.renderFingerCombMale(
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        case "fingerCombFemale":
+          return this.shapeRenderer.renderFingerCombFemale(
+            params,
+            
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+        default:
+          return this.shapeRenderer.renderGenericShape(
+            type,
+            params,
+            styleContext,
+            isSelected,
+            isHovered,
+          );
+      }
+    } catch (error) {
+      console.error("Error in renderShape:", error);
+      return false;
+    }
+  }
+}
